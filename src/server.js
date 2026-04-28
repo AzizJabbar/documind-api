@@ -1,9 +1,9 @@
 const express = require("express");
-const { createClient } = require("@supabase/supabase-js");
 const { v4: uuidv4 } = require("uuid");
 const { GoogleGenAI } = require("@google/genai");
 const { chunkText } = require("./utils");
 const cors = require("cors");
+const pool = require("./db"); // your pg pool
 require("dotenv").config();
 
 const app = express();
@@ -22,20 +22,16 @@ app.use((req, res, next) => {
 	next();
 });
 
-const supabase = createClient(
-	process.env.SUPABASE_URL,
-	process.env.SUPABASE_KEY,
-);
-
-// generate UUID anonym per session (simple demo)
 const userId = uuidv4();
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
 app.use(
 	cors({
 		origin: ["https://azizjabbar.tech"],
 	}),
 );
+
 app.post("/query", async (req, res) => {
 	const { question, user_id } = req.body;
 	try {
@@ -49,13 +45,17 @@ app.post("/query", async (req, res) => {
 		});
 		const queryVector = embeddingResp.embeddings[0].values;
 
-		// 2️⃣ Query Supabase using pgvector distance
-		const { data: chunks, error } = await supabase.rpc("match_chunks", {
-			query_embedding: queryVector,
-			match_count: 5,
-			filter_user_id: user_id ?? null,
-		});
-		if (error) throw error;
+		// 2️⃣ Query using pgvector similarity search (replicates supabase.rpc("match_chunks"))
+		const vectorStr = `[${queryVector.join(",")}]`;
+		const { rows: chunks } = await pool.query(
+			`SELECT id, content, document_id, user_id,
+                    1 - (embedding <=> $1::vector) AS similarity
+             FROM chunks
+             WHERE ($2::uuid IS NULL OR user_id = $2::uuid)
+             ORDER BY embedding <=> $1::vector
+             LIMIT 5`,
+			[vectorStr, user_id ?? null],
+		);
 
 		if (!chunks.length) return res.json({ answer: "No documents found." });
 
@@ -66,7 +66,7 @@ app.post("/query", async (req, res) => {
 		res.setHeader("Cache-Control", "no-cache");
 		res.setHeader("Connection", "keep-alive");
 
-		// 4️⃣ Stream from Gemini using generateContentStream
+		// 4️⃣ Stream from Gemini
 		const stream = await ai.models.generateContentStream({
 			model: "gemini-2.5-flash",
 			contents: `You are a helpful AI assistant.
@@ -94,7 +94,6 @@ Question: ${question}`,
 		res.end();
 	} catch (err) {
 		console.error(err);
-		// If headers already sent, close the stream with an error event
 		if (res.headersSent) {
 			res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
 			res.end();
@@ -104,59 +103,57 @@ Question: ${question}`,
 	}
 });
 
-// Accept single or array
 app.post("/documents", async (req, res) => {
-	const docs = Array.isArray(req.body) ? req.body : [req.body]; // backward-compatible
+	const docs = Array.isArray(req.body) ? req.body : [req.body];
 
-	const rows = docs.map(({ title, content }) => ({
-		title,
-		content,
-		user_id: userId,
-	}));
-	const { data, error } = await supabase
-		.from("documents")
-		.insert(rows)
-		.select();
-	if (error) return res.status(500).json({ error: error.message });
-	for (d of data) {
-		try {
-			const chunks = chunkText(d.content, 300); // chunk per 300 kata
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
 
-			const insertedChunks = [];
+		const insertedDocs = [];
+		for (const { title, content } of docs) {
+			const { rows } = await client.query(
+				`INSERT INTO documents (title, content, user_id)
+                 VALUES ($1, $2, $3)
+                 RETURNING *`,
+				[title, content, userId],
+			);
+			insertedDocs.push(rows[0]);
+		}
+
+		// Embed and insert chunks for each document
+		for (const d of insertedDocs) {
+			const chunks = chunkText(d.content, 300);
 
 			const embeddingResp = await ai.models.embedContent({
 				model: "gemini-embedding-001",
 				contents: chunks,
 				config: {
-					outputDimensionality: 768, // ← must be inside config
+					outputDimensionality: 768,
 				},
 			});
 
 			const vectors = embeddingResp.embeddings.map((e) => e.values);
 
 			for (let i = 0; i < chunks.length; i++) {
-				// 3️⃣ Save to chunks table
-				const { data, error } = await supabase
-					.from("chunks")
-					.insert([
-						{
-							user_id: d.user_id ?? null,
-							document_id: d.id,
-							content: chunks[i],
-							embedding: vectors[i],
-						},
-					])
-					.select();
-
-				if (error) throw error;
-				insertedChunks.push(data[0]);
+				const vectorStr = `[${vectors[i].join(",")}]`;
+				await client.query(
+					`INSERT INTO chunks (user_id, document_id, content, embedding)
+                     VALUES ($1, $2, $3, $4::vector)`,
+					[d.user_id ?? null, d.id, chunks[i], vectorStr],
+				);
 			}
-		} catch (err) {
-			console.error(err);
-			res.status(500).json({ error: err.message });
 		}
+
+		await client.query("COMMIT");
+		res.json({ message: "Documents saved", data: insertedDocs });
+	} catch (err) {
+		await client.query("ROLLBACK");
+		console.error(err);
+		res.status(500).json({ error: err.message });
+	} finally {
+		client.release();
 	}
-	res.json({ message: "Documents saved", data });
 });
 
 const PORT = process.env.PORT || 5000;
