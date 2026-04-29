@@ -51,7 +51,7 @@ app.post("/query", async (req, res) => {
 			`SELECT id, content, document_id, user_id,
                     1 - (embedding <=> $1::vector) AS similarity
              FROM chunks
-             WHERE ($2::uuid IS NULL OR user_id = $2::uuid)
+             WHERE ($2::text IS NULL OR user_id = $2::text)
              ORDER BY embedding <=> $1::vector
              LIMIT 5`,
 			[vectorStr, user_id ?? null],
